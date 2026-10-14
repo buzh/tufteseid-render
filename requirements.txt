@@ -1,5 +1,5 @@
 numpy>=2.0
 pillow>=11.0
-scipy<1.15
+scipy<1.19
 pyproj>=3.6
 matplotlib>=3.7,<3.10
