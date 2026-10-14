@@ -1,0 +1,580 @@
+# The render sidecar
+
+Read before touching anything here. The caller is
+[tufteseid](https://github.com/buzh/tufteseid), whose own half of this contract
+— how a row is ordered, how the markers below are read, and what the app hides
+when the service is off — is its `docs/render-sidecar.md`.
+
+Most of tufteseid's renders are made in the tab that asked for one: a producer
+fetches and paints, and the pixels are PATCHed onto a row that already exists.
+Two kinds do not fit in that. A 360° sun rotation is 72 hillshades of one grid
+and a VP9 encode; an RVT blend is a stack of horizon scans over a grid with
+hundreds of metres of context around it. Both are minutes of work a main thread
+should not be doing, and work worth spending only on a reader whose membership
+carries it.
+
+So this service takes an evidence row, renders it with RVT-py, and writes the
+file back itself. Two producers, `sunloop` and `rvt`; the envelope around them —
+the token check, the queue, the write-back — knows neither from the other.
+
+Python, stdlib HTTP, no framework. `rvt-py` is the one non-obvious dependency.
+
+**Opt-in on the caller's side.** The container runs only where tufteseid's
+`.env` sets `ENABLE_RENDER=true`, and the same key makes the app's render
+controls absent rather than failing. Rows made before the service was turned off
+still read, download and carry their legend; the membership gate below is the
+second filter, on an installation that runs the sidecar at all.
+
+**Not headless QGIS.** PyQGIS offscreen is an 800 MB–2 GB image whose hillshade
+is gdaldem's — the same Lambert cosine with more machinery around it, and none of
+RVT's other visualizations come along.
+
+## Contract
+
+```
+POST /render/sunloop        Authorization: <the caller's PocketBase token>
+{ "evidence": "<record id>", "legend": { … } }
+
+POST /render/rvt            Authorization: <the caller's PocketBase token>
+{ "evidence": "<record id>" }
+
+202  queued                     408  the body stalled on the way in
+400  no body, or not JSON       409  already queued or running for that row
+401  no token, or a stale one   422  the row is not renderable by that route
+403  no render in this          429  queue full, or this caller has one in
+     membership, or may not          flight
+     write that row
+404  no such row                502  PocketBase or the producer fell over
+```
+
+One route per producer, and the row's `kind` must be the route's: `/render/rvt`
+answers 422 for a `sunloop` row. Which blend an `rvt` row is comes out of its
+own `meta.vis`, so the route does not multiply with the recipes.
+
+`GET /render/health` answers `{ok, pending, capacity}`, which is what
+tufteseid's `scripts/live-check.sh` asserts. `ok` is the worker thread's
+liveness and the status follows it: 503 when the thread is gone, 200 while it is
+running. A queue depth is not health — every other route keeps answering
+normally when the only worker has stopped, so that is the one thing the probe
+has to see.
+
+**Which acquisition.** `meta.source` is `auto` — every flight, finest wins per
+pixel, which is what `MOSAIC_RULE` composes — or one acquisition's
+`LAS_PROJECT_NAME`, which goes into both the probe's `where` and the mosaic's,
+so the grid is that flight's own pixels and NaN everywhere it did not fly. The
+name is a fact about the catalogue, not about us: tufteseid's
+`src/terrain/demProjects.ts` reads the list off the same image service, so the
+two ends cannot drift apart. It reaches ArcGIS inside SQL, so `dem.project_of`
+**checks it rather than escaping it** — word characters, spaces and `.,()-/`,
+200 at most — and a name that fails is a 422 like any other unreadable `meta`. A
+render of one flight costs what the mosaic would: the catalogue is filtered, not
+the pixels.
+
+**The client names a row, not a rectangle.** The sidecar reads
+`/api/collections/evidence/records/{id}?expand=spot` with the caller's own token;
+the parameters come out of `meta` and the ground out of the expanded spot's
+`footprint`. A job's cost is therefore bounded by what is stored, not by what was
+posted, and there is no rectangle, resolution or frame count a request can ask
+for.
+
+Because the box is the whole `footprint`, a boundary larger than the cap is
+refused by `bbox_of` (below). Until the sidecar reads a per-tile box from the
+request and fans one job out per tile, the client gates sun loops and RVT blends
+to single-tile spots — the one piece of the mosaic that is not yet server-side.
+
+### The token trade
+
+The service holds no credentials. Every PocketBase call carries the reader's own
+token, so the collection rules decide what a job may touch and the permission
+model is not reimplemented anywhere.
+
+The consequence worth knowing: **the claim PATCH is the write gate, not the GET.**
+A public spot's evidence is readable with no account at all, so a successful read
+proves nothing. The order is read → claim → enqueue, and a claim PocketBase
+refuses is answered 403 before anything is queued.
+
+### Who may render at all
+
+A rule can say who may write a row. It cannot say who may spend two CPU-minutes,
+because that is a fact about the reader rather than about the record — so it is
+asked separately, and first. `admit` POSTs `auth-refresh` with the caller's
+token, and the row that comes back answers both questions at once: `features`
+must carry `render`, and the `id` is the fairness bucket below. An
+administrator holds every feature whatever the row says, which tufteseid's
+`src/auth/features.ts` states on the other end in the same words.
+
+Who holds `render` is granted per account in PocketBase's admin UI. What this
+side knows is one string.
+
+Two things follow from reading it rather than the token. **The token is
+verified**: a bucket cannot be picked by editing a JWT payload, so there is no
+forged-caller case left to reason about. And **a stale token is now 401 rather
+than a confusing 404** on the row read — PocketBase is asked about it before
+anything else is.
+
+A token expiring mid-render loses the write-back, not the render. The row keeps
+its `running` marker until it goes stale.
+
+### Cost control
+
+Signed-in-only falls out of the token check, and members-only out of the
+feature above it. On top of them:
+
+| Limit | Where |
+| --- | --- |
+| One worker thread, serial | `server.py` |
+| Queue of 8, counted as `len(pending)` rather than `jobs.full()` so a request thread can never block on the put | `QUEUE_MAX` |
+| One job per caller, queued or running | `PER_CALLER_MAX` |
+| Footprint ≤ 505 m a side (tufteseid's `MAX_SIDE_M` plus round-trip slack) | `bbox_of` |
+| 1600 px a side, whatever the ground publishes | `sunloop.MAX_FRAME_PX` |
+| Step must divide 360, ≤ 45°; fps 1–60 | `sunloop.spec_of` |
+| 900 s an encode, the feed included, then the child is killed | `sunloop.ENCODE_TIMEOUT_S` |
+| 2200 px a side per fetch, margin and context included, so a blend is two grids of that at most | `blends.MAX_FETCH_PX` |
+| The blend must be one the recipe table names | `blends.spec_of` |
+| 64 kB request body | `MAX_BODY_BYTES` |
+| 10 s a request, headers and body together | `REQUEST_TIMEOUT_S` |
+| `cpus: 2.0`, `mem_limit: 2g` | the caller's compose file |
+
+The compose limits are the ones that matter for the stack: a render must not be
+able to starve the web server or PocketBase.
+
+**The caller, not the row's owner.** `PER_CALLER_MAX` buckets by whoever holds
+the token, because the collection rules let an admin and a spot's author write
+somebody else's evidence: counting the row's owner would let one admin fill the
+queue across eight readers' spots, and would refuse a reader who has queued
+nothing. The id is the one PocketBase handed back with the feature check, so it
+is the token's own and cannot be chosen.
+
+**The request timeout is a thread bound, not a courtesy.** `/render/*` is public
+through a plain reverse proxy, which streams rather than buffers, and the
+token is not looked at until the body is read. So the handler carries a
+`timeout`, which `socketserver` puts on the connection, and the body is read
+`read1` at a time against one deadline rather than in a single blocking `read` —
+a `read` that has asked for 64 kB does not come back until it has them, and the
+socket timeout is renewed by every byte. A body that stalls is answered 408 and
+the connection closed. `protocol_version` stays HTTP/1.0: with no keep-alive a
+connection carries one request, so the deadline bounds the whole thread.
+
+## The ground
+
+The three opening moves are the same for both producers, and the third is where
+a row is settled **empty**.
+
+1. **Coverage probe** (`dem.probe_coverage`) — one `outStatistics` query for
+   `min(OPPLOSNING)` over the rectangle, `where OPPLOSNING IS NOT NULL` so the
+   10 m contour-derived rows cannot answer. No coverage arrives as one feature
+   with a null statistic, and the service upper-cases the field name to `BEST`.
+   A null marks the row **empty** and stops — and with an acquisition named, a
+   null is also what a footprint off the edge of *that* flight answers, which
+   is the point of asking it. A probe that *fails* is not an absence: it falls
+   through at 0.25 m and lets the pixels answer.
+2. **One `exportImage`** per grid — `Prosjekt_DTM`/`Prosjekt_DOM`,
+   `pixelType=F32`, `renderingRule` `None`, the explicit finest-wins
+   `mosaicRule`. No tiling: a grid is coarsened until it fits one call instead.
+   Margin is fetched with it and cropped off after, so the edge is computed
+   against real ground — four pixels for a sun loop's gradient, tens of metres
+   for a blend, whose scales reach much further.
+
+   **About 2200 px a side is the practical ceiling** for an F32 grid: past it
+   `exportImage` answers 500 under its own 60 s timeout, the more readily the
+   busier it is. That is the client's own `MAX_DEM_PX_PER_SIDE` and it is what
+   `blends.MAX_FETCH_PX` coarsens against; a sun loop stays under it by way of
+   `MAX_FRAME_PX`, which is lower for reasons of its own.
+
+   The pixel size is settled before the fetch and is **square by construction**:
+   the width's pixel count fixes `metres_per_px` — rounded even for a loop,
+   whose encoder demands it — the height follows from that same figure, and the
+   rectangle is then trimmed to the pixel grid about its centre. Otherwise
+   `slope_aspect`, which is told
+   `resolution_x == resolution_y`, and the burnt-in scale bar, which is drawn
+   from one number, would both be wrong down the frame for a footprint whose two
+   sides round differently — reachable, because the EPSG:4326 round trip is
+   allowed its metre or two. The trim is sub-pixel, and the rectangle that is
+   fetched is the `bbox25833` that `meta` reports.
+3. **Decode** with `read_tiff_f32` (`tiff.py`). Its treatment of absent tiles is
+   load-bearing: `TileOffsets: 0` inside a valid TIFF must become NaN, where a
+   generic reader hands back zeros — and sea level already reads exactly 0.0.
+
+   **The hole mask is taken here, once, and the coverage gate is here too.** The
+   catalogue answers for the rectangle as a whole, so a footprint over the edge
+   of an acquisition or a lake the DTM is sparse over passes the probe and
+   decodes mostly NaN. `binary_dilation` of the non-finite pixels, cropped to the
+   rendered rectangle, is both the mask absence is painted with and the measure:
+   under `MIN_COVERAGE` (half the square) the row is marked **empty** rather than
+   given a picture of its own holes, and what is left is stored as
+   `meta.coverage`.
+
+   Dilation, because rvt's derivative substitutes a pixel's own value for a NaN
+   neighbour (`roll_fill_nans`) and so halves the gradient right around a hole.
+   rvt restores the input's NaN mask onto its output, so the hole itself is *not*
+   drawn larger than it is; the invented rim is the reason for the extra pixel.
+
+**One float-TIFF reader, two copies.** `tiff.py` is the same decoder as
+tufteseid's `vat-cache/fetch_dem.py`, which keeps it for the out-of-band cVAT
+pipeline. The repo split cut the import, not the coupling: one endpoint, one set
+of quirks, and a fix learned at either end is carried to the other by hand.
+
+## The sun loop
+
+Picking up from the decoded grid.
+
+4. **`slope_aspect` once**, then `hillshade(…, slope=, aspect=)` per azimuth.
+   That is RVT's own reuse parameter, so the gradient is computed once without
+   reimplementing anything. Two things follow from it and are easy to get wrong:
+   - The vertical exaggeration goes on `slope_aspect`. Given slope and aspect,
+     `hillshade` never touches the DEM again and its own `ve_factor` is dead.
+   - `slope_aspect` runs on a 1-px-padded grid, because `hillshade` pads
+     internally and crops `[1:-1, 1:-1]` off the result whether it computed the
+     gradient or was handed one.
+5. **`byte_scale(…, c_min=0, c_max=1)`**, not its default per-array stretch, or
+   every frame is scaled to its own extremes and the loop pumps. Then the mask is
+   stamped on at `NO_DATA_VALUE`, mid grey. `byte_scale` writes a NaN as **255**,
+   which is pure white and indistinguishable from fully lit ground, so absence
+   has to be painted over the finished frame. Mid grey and not either end,
+   because a real frame saturates at both: whole slopes come out 0 and lit faces
+   come out 255.
+6. **The band is composed once** (`legend.py`) and stacked under every frame, so
+   the ground keeps the whole rectangle and the frame is taller than it.
+7. **Raw grey straight into ffmpeg**: `-f rawvideo -pix_fmt gray … -c:v libvpx-vp9
+   -pix_fmt yuv420p -crf 32 -b:v 0 -row-mt 1 -g <frames>`. No PNG round trip and
+   no frame files. Dimensions are forced even for `yuv420p` — the width and the
+   ground's height in `sunloop`, the frame's whole height by the band, which is
+   the only part of it that can now be an odd number of rows. One GOP: the loop
+   is played whole, and a second keyframe in 72 frames of hillshade costs more
+   file than the seek bar saves — scrubbing decodes forward from the one
+   keyframe, which is a short wait on a file this size and already buffered.
+   The output goes to a real file: a WebM written to a pipe cannot be seeked
+   back to for its cues, and without them the reader can neither seek nor read
+   the loop's length off the header. So does
+   **stderr**: 72 frames of up to 1600 px is ~180 MB fed down stdin over minutes
+   during which nothing here can drain a pipe, and an ffmpeg blocked on a full
+   stderr would stop reading stdin and wedge both ends for good. A timer kills
+   the child at `ENCODE_TIMEOUT_S`, so the deadline covers the feed and not only
+   the wait at the end, and the child is killed and reaped on every path out —
+   an abandoned ffmpeg would go on burning both cores against an output file the
+   temporary-file block has already unlinked.
+8. **Measured, not predicted**, the way the client's own `fitImageBlob` is: over
+   the field's 50 MB the encode is redone at crf 40 then 48, and a third failure
+   is a failure. PocketBase answers 400 to an oversized file and answers it again
+   to every retry of the same bytes.
+9. **One multipart PATCH** puts the file and the finished `meta` on together,
+   hand-rolled over `urllib`.
+
+0° and 355° make the loop seamless by construction; `<video loop>` does the rest.
+
+Budget at 1600 px: ~3 s of RVT, ~5–15 s of fetch, ~20–60 s of VP9.
+
+## The RVT blends
+
+`blends.py`. One kind, `rvt`, and a table of recipes keyed by `meta.vis`;
+e4MSTP is the one entry today. **Not named `rvt.py`** — a module of that name in
+`/app` shadows the installed `rvt` package, and every import inside it would
+resolve to itself.
+
+Each recipe is **transcribed** from `rvt.blend` and built on `rvt.vis` and
+`rvt.blend_func` alone. e4MSTP is not in rvt-py 2.2.3 at all, only in the
+upstream master, and `rvt.blend` and `rvt.default` import `osgeo.gdal` for an IO
+layer none of this touches. The transcription was checked against
+`rvt.blend.e4mstp` on real ground and is equal to the bit. Same trade and the
+same blend loop — normalize, ramp, blend, render, last layer first — as
+tufteseid's `vat-cache/cvat.py`.
+
+**RVT's radii are pixel counts calibrated at 0.5 m/px**, so they are scaled here
+to hold their reach in metres whatever the acquisition publishes. A 0.25 m
+project would otherwise get half the neighbourhood the blend was designed
+around.
+
+**Two grids, because a blend reads far outside what it draws.** e4MSTP's broad
+MSTP scale reaches 250 m and its other layers 25 m. Given no context RVT pads
+`symmetric`, and the broad channel becomes a picture of the mirror. Fetching
+250 m of real ground on every side of a 500 m footprint at 0.25 m would be a
+4000 px grid, which `exportImage` sheds. So:
+
+| Grid | Covers | At | Feeds |
+| --- | --- | --- | --- |
+| fine | footprint + 25 m | the acquisition's own resolution, coarsened to fit `MAX_FETCH_PX` | local and meso MSTP, SVF, openness, local dominance, slope |
+| coarse | footprint + 250 m | 0.5 m/px or coarser | the broad MSTP channel alone, resampled up bilinearly |
+
+Measured against context fetched at full resolution, the coarse channel costs a
+mean 0.005 of the finished pixel; mirroring costs 0.087.
+
+**The slope layer is in radians, and that is not a bug.** `rvt.blend.e4mstp`
+calls `slope_aspect` without `output_units`, so the bottom layer is radians
+normalized over 0..55 — an all-but-flat dark red, which is where the blend's
+colour comes from. Passing degrees instead, which is RVT's own default
+elsewhere, produces a plausible picture that is not e4MSTP. The transcription
+keeps the radians, and this paragraph is the only place that says so.
+
+The output is an **RGBA PNG, alpha 0 where the ground is absent** — the dilated
+hole mask, plus any pixel the blend itself left non-finite. `meta` is
+`metresPerPx`, `bbox25833`, `coverage` and `renderedAt`; no `bandTop`, because
+this kind is **stored bare**. A still is stamped in the reader's own tab at
+download time, so `WANTS_LEGEND` is false, `legend.py` never runs for it, and the
+stored pixels are the ones the map lays back over the ground.
+
+Budget, measured against live hoydedata.no on a 505 m footprint of 0.25 m
+ground — the worst case the footprint cap allows: 2002 px fine and 2010 px
+coarse, 200 s of fetch, 90 s of compute (62 of it local dominance), a 9.3 MB
+PNG, 315 s all told and 1.0 GB peak RSS against the container's 2 GB. A 300 m
+footprint is 45 s and 3.4 MB. The fetch dominates and varies with the day; the
+compute does not.
+
+## When hoydedata.no is slow
+
+The rule is that **no picture is made worse to get it made**. A grid is the
+resolution the acquisition publishes and the context the blend needs; a service
+that cannot supply that gets waited on, and failing that the row is marked
+`failed` and the reader is offered the retry. Nothing coarsens, crops, or fills
+in to finish on time.
+
+So the patience is where the cost is bounded, not the pixels:
+
+| | | |
+| --- | --- | --- |
+| `FETCH_TIMEOUT_S` | 600 s | one attempt, and it is the *socket's* timeout, so it bounds how long the service may stay silent rather than how long a transfer may take. ArcGIS composes the whole mosaic before sending a byte, and 134 s of that has been measured on a 2200 px grid |
+| `FETCH_BUDGET_S` | 900 s | every attempt at one grid together, so patience never multiplies by the retry count. A blend fetches two grids and may spend twice this |
+| `MAX_ATTEMPTS` | 6 | with backoff doubling to a 60 s cap, jittered. A shed burst recovers in seconds; real load does not, and hammering is how a slow minute becomes a slow hour |
+| `PROBE_TIMEOUT_S` | 20 s | no retry. A probe that fails costs only this, because the fall-through assumes the finest resolution the services publish — erring towards more pixels than the ground has, never fewer |
+
+Every attempt after the first is logged with the grid's size and the reason, so
+a slow render can be told from a stuck one in the log rather than by waiting.
+
+The trade this accepts: one job can now hold the single worker for half an hour
+against a service having a bad afternoon, with `QUEUE_MAX` 8 behind it and
+`PER_CALLER_MAX` 1 refusing that reader a second order meanwhile. The heartbeat
+keeps every one of those rows honestly marked `queued` or `running`, so nothing
+goes stale and nothing lies.
+
+**Direct to hoydedata.no, never through a cache.** Every job is a rectangle
+nobody will ask for again, so caching one only evicts tiles that are re-read —
+the same rule tufteseid's `vat-cache/` follows.
+
+## Progress, without polling
+
+The sidecar writes `meta.job = {state, at, detail}` when it takes a job and when
+it fails; success replaces the whole marker with the file and the usual
+`metresPerPx`, `bbox25833`, `coverage` and `renderedAt`, plus whatever the
+producer adds — a loop's `frames`, `durationMs` and `bandTop`.
+The app is already subscribed to the row, so progress arrives over the existing
+feed and **survives a reload or a closed tab**, which a browser render does not.
+
+**The marker is beaten.** `Heartbeat` rewrites `job.at` every `BEAT_S` (60 s) on
+every row in `pending` — the running one and whatever is waiting behind it — each
+with the token its own caller handed over. It is a thread and not a call out of
+the `trace` callback, because the stretches with nothing to report are exactly
+the ones that matter: `fetch_grid` can hold five 180 s attempts with backoff and
+the encode ladder three 900 s ones, so a job is silent for tens of minutes while
+perfectly healthy. It beats the queue as well, because nothing is queued unless
+something is running.
+
+The worker is the only other writer of these markers and all of its own writes
+sit outside `start`/`stop`; `stop` **joins** rather than merely signalling,
+because a beat still in flight when `attach` runs would put the pre-render meta
+back over the meta that describes the file. It is stopped in a `finally`, so a
+render that throws does not leave a thread beating a row nobody is rendering.
+
+So an unrefreshed marker means nobody is working on the row. **The beat interval
+is the contract**: tufteseid condemns a marker after five of them, so a container
+restarted mid-job offers a retry within minutes rather than after a quarter of an
+hour, and a slow job is never condemned for being slow. Lengthening `BEAT_S`
+without telling the other end shortens that margin.
+
+A retry drops the stale marker in `accept()` before anything is written from it.
+Without that, a second run that succeeds lands a row whose meta still says the
+first one failed.
+
+**A refused handover writes nothing.** An answer of 403, 429 or 503 has queued
+nothing and marked nothing, so the row the caller was holding would stand for
+ever with neither pixels nor state. Deleting it is the caller's move, and
+tufteseid makes it; what matters here is that a refusal leaves no trace to clean
+up. A handover that merely *times out* may yet have been claimed, which is why
+the client leaves those alone.
+
+## The legend
+
+This section is the sun loop's alone. The loop leaves the server already cited,
+because the client cannot stamp it afterwards: its stamping path is
+`createImageBitmap`, which throws on a WebM. So a still is stamped at the door
+and a loop is burnt at render time — including a still the sidecar rendered,
+which is why a producer declares `WANTS_LEGEND` and the `rvt` one declares it
+false. Nothing composes a band for a producer that does not want one, and no
+`legend` is read off its request body.
+
+The *wording* is the client's either way: it composes the `{title, facts, rights,
+centre, link}` this takes. Which facts a visualization answered to is the
+client's rule and stays in one place, and the client is the only side that knows
+the reader's language.
+
+**What the wording asserts is not the client's.** A stamped still is drawn in the
+reader's own tab out of a record they just read; a loop's band is drawn by a
+server for a file a public spot then serves to anyone with the URL, and nothing
+downstream can tell a true band from a false one — it is in the pixels. So the
+sidecar substitutes rather than trusts: what the band says about the record is
+taken off the record it is already holding (`?expand=spot`) and put into the
+lines it was sent.
+
+| Field | Whose |
+| --- | --- |
+| `title`, `facts`, `decimal` | the client's, bounded and otherwise untouched |
+| `resolutionFormat` | the client's wording, with `{res}` filled in by `legend.py` |
+| the credit inside `rights` | `CREDIT_TOKEN` (`{credit}`), filled from `expand.spot.credit` by `legend_of` |
+| `link` | composed by `share_link` from the spot's `code` and `visibility`; a `link` in the body is ignored |
+
+The rest of a rights line — the role, the holder, the licence — is still wording
+the client chose, so a caller who may PATCH the row can still put a wrong licence
+on a band. What they cannot do is put somebody else's name on their own render,
+or point the link somewhere else.
+
+`PUBLIC_ORIGIN` is how the sidecar knows what to link to: the origin readers
+visit, set in the caller's compose file, with the scheme stripped off the way the
+client strips it so the two bands read the same. Unset, a loop prints no link,
+and so does a spot that is private — its code resolves for nobody but its owner,
+which is the rule a stamped still follows too. Not the request's `Host`: that is
+the caller's to set, and a link burnt into a frame is a phishing primitive.
+
+Three honest differences from a stamped still, all of them consequences of
+burning early:
+
+- **The band is fixed at render time.** A credit edited afterwards is not
+  reflected in the loop, though it is in the caption and in a downloaded still.
+- **The resolution is the one fact nobody can know in advance**, so it travels as
+  `{res}` inside a pre-localized format string that the sidecar substitutes and
+  draws its scale bar from. The decimal separator travels with it: the rest of
+  the band is already in the reader's language, and `0.50 m/px` next to `z 1,5`
+  reads as a typo.
+- **No render date, and no stored resolution.** The client builds a loop's facts
+  from what the catalogue knew before any pixel existed, rather than from the
+  stored `meta.metresPerPx` and `meta.renderedAt`. On a first render those are
+  absent; on a re-render they are the *previous* attempt's, and would print an
+  old resolution beside the substituted one and a date older than the pixels
+  under it.
+
+The shape is the client's and so is the placement: a head line, the rights lines
+under it, a footer row carrying the scale bar, and the whole band **appended
+under** the frame rather than blended over its bottom edge. So the ground keeps
+the whole rectangle and `bbox25833` is the rows above the band. A loop is
+rendered at the acquisition's own resolution — a 140 m footprint of half-metre
+ground is 276 px, of which a band that cannot set type below 11 px is better
+than a third, and blended in that third of the footprint would be caption
+instead of ground on the map.
+
+Four small differences from the still. The face is DejaVu, not Mulish — the image
+has no npm build to take Mulish from. The whole head line is bold rather than the
+title alone. The link sits beside the bar in the small face rather than in a cell
+of its own, and there is no centre cell. And past 40 % of the ground's height the
+link is dropped, then the scale bar, where a still instead mats its capture out
+to whatever width the band needs; a loop cannot, because its frames are the video
+and the band is already the thing keeping their height even. The rights lines are
+never shed either way.
+
+The difference that is not cosmetic is where the band ends up. A still's is in
+the downloaded copy only, and the stored file stays bare — which is the one the
+map lays back over the ground. A loop's is in the stored file for good, which is
+what `meta.bandTop` is for: a fraction of the frame's height, saying where the
+ground stops, so the reading can lay the rows above it over the footprint and
+leave the caption in the file. The file keeps its citation; the map does not wear
+it. **A loop rendered before the band moved under the frame** has ground where
+the overlay now expects caption, and comes out stretched down the footprint;
+re-asking for the loop is the fix, since nothing re-renders a row by itself.
+
+`ImageDraw` on an `L`-mode image defaults its ink to **1**, not 255, so every
+text call passes `fill=INK` explicitly. Getting that wrong draws the band and the
+bar and no words at all.
+
+## Failure modes
+
+There is one worker and it is never replaced, so nothing thrown inside the loop
+body is allowed to leave it: a job that fails is logged and marked, and a
+failure write that itself fails is logged and dropped. `pb._call` raises
+`PbError` and nothing else — a truncated or non-JSON answer from PocketBase is
+converted there rather than escaping as a `JSONDecodeError` — and both call
+sites catch broadly anyway, because a thread that unwinds takes every later
+render with it. If the thread stops all the same, `/health` answers 503 and the
+caller's `live-check.sh` fails, rather than reporting a sidecar that renders
+nothing.
+
+| What happens | What the row says |
+| --- | --- |
+| No laser data over the footprint, or a grid under half covered once decoded | `job.state = empty` — an answer about the ground rather than a fault, and still worth asking again |
+| `exportImage` sheds (a text body under a 200 status) | retried with growing, jittered backoff inside `fetch_grid` until `FETCH_BUDGET_S` or `MAX_ATTEMPTS` runs out, then `failed` |
+| hoydedata.no is merely slow | waited out — 600 s of silence per attempt, 900 s a grid, and the marker is beaten throughout, so the row says `rendering` rather than going stale |
+| The coverage probe itself errors | logged, render continues at 0.25 m |
+| ffmpeg fails, or the file will not fit after three encodes | `failed`, with ffmpeg's stderr in `job.detail` (300 chars) |
+| A blend's PNG will not fit the 50 MB field | `failed` — there is no re-encode ladder for a still, and the worst case the footprint cap allows measures 9.3 MB |
+| An encode passes 900 s | the child is killed and reaped, `failed`, and the worker takes the next job with nothing left running |
+| The container is restarted mid-job | nothing beats the markers any more, so they go stale and read as `failed`; the queue is not persisted, so the rows that were waiting go with it |
+| The caller's membership does not carry `render` | 403 before the row is read, nothing queued, nothing written |
+| PocketBase will not recognise the token | 401 at the same point, which is also what an expired session looks like |
+| PocketBase refuses the claim | 403 to the caller, the queue slot is given back, no marker written |
+| The failure write itself fails | logged and dropped; the loop takes the next job and the stale rule catches the row |
+
+## Running it
+
+The image is published to `ghcr.io/buzh/tufteseid-render` by
+`.github/workflows/publish.yml`: a push to `main` tags `main` and the commit's
+sha, and a `v*` tag tags the version and `latest`. Consumers pin a version tag —
+tufteseid's `docker-compose.yml` does.
+
+```
+docker build -t tufteseid-render .
+docker run --rm -p 8080:8080 \
+  -e POCKETBASE_URL=http://pocketbase:8090 \
+  -e PUBLIC_ORIGIN=https://example.org \
+  tufteseid-render
+```
+
+| Variable | What |
+| --- | --- |
+| `POCKETBASE_URL` | where the records are. Defaults to `http://pocketbase:8090`, which is the compose name on the caller's network |
+| `PUBLIC_ORIGIN` | the origin readers visit, for the link burnt into a loop's band. Unset, a loop prints no link |
+
+Both are read at startup, so changing either recreates the container. Getting
+`PUBLIC_ORIGIN` wrong costs a wrong link in the band of every loop rendered
+since.
+
+`rvt-py` is installed `--no-deps`: it declares gdal, rasterio, geopandas and
+jupyter for an IO layer none of this touches. `requirements.txt` carries what
+`rvt.vis` and `rvt.blend_func` actually reach for — numpy, pillow, pyproj,
+`scipy<1.15` (it imports `scipy.ndimage.morphology`, removed there) and
+`matplotlib<3.10` (it imports `matplotlib.cm.get_cmap`, removed there), which
+e4MSTP's slope layer genuinely draws a ramp from. Both caps are a 2.2.3 that
+stopped being maintained rather than anything this code wants, and both are
+**startup** failures: the producer modules are imported by `server.py`, so a
+sidecar with the wrong version of either does not answer `/health` at all. That
+import is what the `build` workflow runs against the finished image, so a cap
+that has slipped fails on the pull request rather than on somebody's deploy.
+`rvt/__init__.py` is a docstring, and `rvt.blend` and `rvt.default` — the two
+that want GDAL — are never imported.
+
+**The base image is `python:3.11-slim` and must stay under 3.12.** rvt-py 2.2.3
+declares `Requires-Python: >=3.6, <3.12`, and pip does not report that as a
+conflict — it drops the release from the index and says no such version exists,
+listing 2.2.1 as the newest there is. Bumping the base image therefore looks
+like an upstream that deleted a release. The pin is 2.2.3 because that is what
+tufteseid's `vat-cache/` runs and what the shading was checked against.
+
+## Adding a producer
+
+A producer is a module with four names, and `server.py` knows nothing else about
+one:
+
+| Name | What |
+| --- | --- |
+| `KIND` | the `kind` a row must carry; a request for a row of any other is refused 422 |
+| `WANTS_LEGEND` | whether a band is composed and handed to `render` |
+| `spec_of(meta)` | the stored parameters, read back rather than trusted; raises `ValueError`, which becomes the 422's text |
+| `render(spec, bbox25833, legend_content, log)` | `(blob, filename, content_type, meta)`, or `None` for "the ground has nothing here" |
+
+Then one entry in `ROUTES`, which is the whole of the wiring. What is already
+general: the token check, `Refused`, the queue and its limits, `bbox_of`, the
+heartbeat, the claim/attach pair, and the `meta.job` protocol the client reads.
+
+A new producer is **a change in both repos**: the kind, the route and the module
+here, and on tufteseid's side a migration adding the kind to `evi_kind`, a
+variant in `src/evidence/spec.ts`, an arm in `labels.ts`, somewhere to ask for
+it, and a branch in its queue that POSTs instead of rendering. Its
+`docs/render-sidecar.md` states that half.
+
+**A blend is not a producer.** Another RVT visualization is one entry in
+`blends.PRODUCERS` and one on the client's list of blends, and nothing else: the
+kind, the route, the migration and the line loop already exist.

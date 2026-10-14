@@ -116,7 +116,8 @@ def _multipart(fields, file_field, filename, content_type, blob):
 
 def attach(record_id, token, filename, content_type, blob, meta):
     """File and meta in one request, so a row can never hold pixels its meta
-    does not describe. Mirrors `attachEvidenceFile` in `src/api/evidence.ts`."""
+    does not describe. Mirrors `attachEvidenceFile` in tufteseid's
+    `src/api/evidence.ts`."""
     body, header = _multipart(
         {"meta": json.dumps(meta)}, "file", filename, content_type, blob
     )

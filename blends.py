@@ -7,7 +7,7 @@ Each recipe is transcribed from `rvt.blend` and built on `rvt.vis` and
 `rvt.blend_func` alone, because `rvt.blend` and `rvt.default` import
 `osgeo.gdal`. The transcription of e4MSTP was checked against
 `rvt.blend.e4mstp` on real ground and is equal to the bit. Same trade, and the
-same blend loop, as `vat-cache/cvat.py`.
+same blend loop, as tufteseid's `vat-cache/cvat.py`.
 
 RVT states its radii as pixel counts against a 0.5 m DEM, so they are scaled
 here to hold their reach in metres whatever the acquisition publishes.
@@ -234,7 +234,7 @@ PRODUCERS = {
 
 def spec_of(meta):
     """The stored parameters, read back rather than trusted. Mirrors the `rvt`
-    arm of `specOf` in `src/evidence/spec.ts`."""
+    arm of `specOf` in tufteseid's `src/evidence/spec.ts`."""
     if not isinstance(meta, dict):
         raise ValueError("meta is not an object")
     vis = meta.get("vis")

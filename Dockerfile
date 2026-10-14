@@ -6,12 +6,11 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY rendersvc/requirements.txt ./
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt \
   && pip install --no-cache-dir --no-deps rvt-py==2.2.3
 
-COPY vat-cache/fetch_dem.py ./
-COPY rendersvc/*.py ./
+COPY *.py ./
 
 RUN useradd --system --no-create-home rendersvc
 USER rendersvc

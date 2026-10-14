@@ -1,14 +1,15 @@
 """The provenance band, burnt under every frame.
 
-A still is stamped in the browser at download time (`src/evidence/download.ts`),
-but `createImageBitmap` throws on a WebM, so a loop is cited on the way out
-instead. The client sends the lines — which facts a visualization answered to is
-its rule and stays in one place — and this only typesets them. The lines arrive
-with holes in them where a fact has to come off the record instead of out of the
-request; `server.py`'s `legend_of` fills those, this one the resolution.
+A still is stamped in the browser at download time (tufteseid's
+`src/evidence/download.ts`), but `createImageBitmap` throws on a WebM, so a loop
+is cited on the way out instead. The client sends the lines — which facts a
+visualization answered to is its rule and stays in one place — and this only
+typesets them. The lines arrive with holes in them where a fact has to come off
+the record instead of out of the request; `server.py`'s `legend_of` fills those,
+this one the resolution.
 
-`src/evidence/legend.ts` lays out the same three parts and appends the band the
-same way, so neither spends a pixel of ground on caption. A loop is rendered at
+Tufteseid's `src/evidence/legend.ts` lays out the same three parts and appends
+the band the same way, so neither spends a pixel of ground on caption. A loop is rendered at
 the acquisition's own resolution — 140 m of half-metre ground is 276 px, of which
 a band that cannot set type below 11 px is better than a third — and blended in,
 that third of the footprint would be caption instead of ground on the map.

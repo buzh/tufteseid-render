@@ -60,7 +60,7 @@ def _number(value, low, high):
 
 def spec_of(meta):
     """The stored parameters, read back rather than trusted. Mirrors `specOf`
-    for the `sunloop` arm in `src/evidence/spec.ts`."""
+    for the `sunloop` arm in tufteseid's `src/evidence/spec.ts`."""
     if not isinstance(meta, dict):
         raise ValueError("meta is not an object")
     model = meta.get("model")
